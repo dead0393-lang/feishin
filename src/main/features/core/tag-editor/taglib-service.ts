@@ -3,6 +3,8 @@ import type { ArtworkKind, ArtworkOp, BatchFileError, TagValue } from '/@/shared
 import { constants, promises as fsPromises } from 'fs';
 import { PROPERTIES, TagLib } from 'taglib-wasm';
 
+type AudioFile = Awaited<ReturnType<TagLib['open']>>;
+
 import { getImageMimeTypeFromPath } from '/@/shared/utils/image-mime';
 
 let _taglib: null | TagLib = null;
@@ -10,6 +12,38 @@ let _taglib: null | TagLib = null;
 const getTagLib = async (): Promise<TagLib> => {
     if (!_taglib) _taglib = await TagLib.initialize();
     return _taglib;
+};
+
+/**
+ * WASI path I/O fails with TL_ERROR_IO_READ (-4) on some host paths
+ * (Unicode, drive preopens, `/Z/...` style). Node can still read the bytes.
+ */
+const openFromBuffer = async (taglib: TagLib, filePath: string): Promise<AudioFile> => {
+    const data = new Uint8Array(await fsPromises.readFile(filePath));
+    return taglib.open(data);
+};
+
+const openAudioFile = async (taglib: TagLib, filePath: string): Promise<AudioFile> => {
+    try {
+        return await taglib.open(filePath);
+    } catch {
+        return openFromBuffer(taglib, filePath);
+    }
+};
+
+const editAudioFile = async (
+    taglib: TagLib,
+    filePath: string,
+    fn: (file: AudioFile) => void,
+): Promise<void> => {
+    try {
+        await taglib.edit(filePath, fn);
+    } catch {
+        const data = new Uint8Array(await fsPromises.readFile(filePath));
+        const out = await taglib.edit(data, fn);
+        if (!out) throw new Error(`Buffer edit returned no data: ${filePath}`);
+        await fsPromises.writeFile(filePath, out);
+    }
 };
 
 const BATCH_CONCURRENCY = 8;
@@ -150,7 +184,7 @@ export async function readFilesMetadataBatch(
         async (filePath) => {
             try {
                 await fsPromises.access(filePath, constants.F_OK);
-                const file = await taglib.open(filePath);
+                const file = await openAudioFile(taglib, filePath);
                 try {
                     const rawProperties = file.properties();
                     const embeddedLyrics = file.getLyrics();
@@ -271,7 +305,7 @@ export async function writeFilesTags(
 
     await mapWithConcurrency(writablePaths, BATCH_CONCURRENCY, async (path) => {
         try {
-            await taglib.edit(path, (file) => {
+            await editAudioFile(taglib, path, (file) => {
                 const propertyEdits = Object.entries(edits).filter(([key]) => key !== 'lyrics');
                 const propertyRemovals = removed.filter((key) => key !== 'lyrics');
 
